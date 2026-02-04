@@ -359,14 +359,7 @@ def generate_sub_features_idx(adj_batch, features_batch, size_subgraph=10, k_nei
 
 def generate_sub_features_idx_fast(adj_batch, features_batch, size_subgraph=10, k_neighbor=1):
     """
-    优化版本：使用纯 PyTorch 操作，GPU 加速
-    
-    相比原版：
-    - 不使用 networkx（避免 CPU-GPU 转换）
-    - 批量计算 k-hop neighbors（使用邻接矩阵的幂）
-    - 全部在 GPU 上计算
-    
-    预期加速：10-20x
+
     """
     sub_features_idx_list = []
     sub_adj_list = []
@@ -376,15 +369,12 @@ def generate_sub_features_idx_fast(adj_batch, features_batch, size_subgraph=10, 
         x = features_batch[i]
         num_nodes = x.shape[0]
         device = adj.device
-        
-        # 转换为 dense（如果是 sparse）
+
         if adj.is_sparse:
             adj_dense = adj.to_dense()
         else:
             adj_dense = adj
         
-        # 计算 k-hop 邻接矩阵
-        # A^k 表示 k-hop 的连通性
         adj_k = adj_dense.clone()
         if k_neighbor > 0:
             adj_power = adj_dense.clone()
@@ -392,40 +382,29 @@ def generate_sub_features_idx_fast(adj_batch, features_batch, size_subgraph=10, 
                 adj_power = torch.matmul(adj_power, adj_dense)
                 adj_k = adj_k + adj_power
         
-        # 二值化（有连接就是1）
         adj_k = (adj_k > 0).float()
         
-        # 为每个节点选择 k-hop neighbors
         x_sub_idx = torch.zeros(num_nodes, size_subgraph, dtype=torch.long, device=device)
         x_sub_adj = torch.zeros(num_nodes, size_subgraph, size_subgraph, device=device)
         
         for node in range(num_nodes):
-            # 获取该节点的 k-hop neighbors（包括自己）
             neighbors = torch.nonzero(adj_k[node], as_tuple=False).squeeze(-1)
             
-            # 确保包含节点自己
             if node not in neighbors:
                 neighbors = torch.cat([torch.tensor([node], device=device), neighbors])
             
-            # 截断或填充到 size_subgraph
             n_neighbors = min(len(neighbors), size_subgraph)
             
             if n_neighbors > 0:
-                # 取前 size_subgraph 个邻居
                 sub_idxs = neighbors[:size_subgraph]
                 
-                # 填充索引
                 x_sub_idx[node, :n_neighbors] = sub_idxs
                 if n_neighbors < size_subgraph:
-                    # 用 num_nodes 填充（padding index）
                     x_sub_idx[node, n_neighbors:] = num_nodes
                 
-                # 提取子图邻接矩阵
-                # 使用 advanced indexing
                 sub_adj = adj_dense[sub_idxs][:, sub_idxs]
                 x_sub_adj[node, :n_neighbors, :n_neighbors] = sub_adj
             else:
-                # 如果没有邻居，用 padding
                 x_sub_idx[node, :] = num_nodes
         
         sub_features_idx_list.append(x_sub_idx)
@@ -438,11 +417,7 @@ def generate_sub_features_idx_fast(adj_batch, features_batch, size_subgraph=10, 
 
 
 def generate_sub_features_idx_vectorized(adj_batch, features_batch, size_subgraph=10, k_neighbor=1):
-    """
-    完全向量化版本：避免 Python 循环，使用纯 PyTorch 批量操作
-    
-    预期加速：20-50x
-    """
+
     sub_features_idx_list = []
     sub_adj_list = []
     
@@ -452,15 +427,14 @@ def generate_sub_features_idx_vectorized(adj_batch, features_batch, size_subgrap
         num_nodes = x.shape[0]
         device = adj.device
         
-        # 转换为 dense
         if adj.is_sparse:
             adj_dense = adj.to_dense()
         else:
             adj_dense = adj
         
-        # 计算 k-hop 邻接矩阵（包括自己）
+
         adj_k = adj_dense.clone()
-        # 添加自连接
+
         adj_k = adj_k + torch.eye(num_nodes, device=device)
         
         if k_neighbor > 0:
@@ -469,47 +443,35 @@ def generate_sub_features_idx_vectorized(adj_batch, features_batch, size_subgrap
                 adj_power = torch.matmul(adj_power, adj_dense)
                 adj_k = adj_k + adj_power
         
-        # 二值化
         adj_k = (adj_k > 0).float()
-        
-        # 批量处理：为所有节点一次性找到邻居
-        # 方法：对每一行排序，取前 size_subgraph 个
-        
-        # 创建邻居索引矩阵 (num_nodes, num_nodes)
-        # 每行是该节点的邻居列表
         node_indices = torch.arange(num_nodes, device=device).unsqueeze(0).expand(num_nodes, -1)
-        
-        # 只保留有连接的节点索引，其他设为 num_nodes（padding）
         neighbor_indices = torch.where(adj_k > 0, node_indices, torch.full_like(node_indices, num_nodes))
-        
-        # 排序，使有效邻居在前面（因为 num_nodes 最大，会被排到后面）
         sorted_neighbors, _ = torch.sort(neighbor_indices, dim=1)
         
-        # 取前 size_subgraph 个
+        # size_subgraph
         x_sub_idx = sorted_neighbors[:, :size_subgraph]
         
-        # 批量提取子图邻接矩阵
-        # 使用 advanced indexing: adj_dense[i, j] -> sub_adj[node, :, :]
-        # 对每个节点 n，提取 adj_dense[sub_idx[n], :][:, sub_idx[n]]
+        # advanced indexing: adj_dense[i, j] -> sub_adj[node, :, :]
+        # adj_dense[sub_idx[n], :][:, sub_idx[n]]
         
-        # 方法：创建一个 gather index
+        # gather index
         batch_idx = torch.arange(num_nodes, device=device).unsqueeze(1).unsqueeze(2).expand(-1, size_subgraph, size_subgraph)
         row_idx = x_sub_idx.unsqueeze(2).expand(-1, -1, size_subgraph)  # (num_nodes, size_subgraph, size_subgraph)
         col_idx = x_sub_idx.unsqueeze(1).expand(-1, size_subgraph, -1)  # (num_nodes, size_subgraph, size_subgraph)
         
-        # 处理 padding（num_nodes 索引）
+
         valid_row = (row_idx < num_nodes).float()
         valid_col = (col_idx < num_nodes).float()
         valid_mask = valid_row * valid_col
         
-        # 将越界索引替换为 0（避免索引错误）
+
         row_idx_safe = torch.clamp(row_idx, 0, num_nodes - 1)
         col_idx_safe = torch.clamp(col_idx, 0, num_nodes - 1)
         
-        # 提取子图邻接矩阵
+
         x_sub_adj = adj_dense[row_idx_safe, col_idx_safe]
         
-        # 应用 mask（padding 位置设为 0）
+        # mask
         x_sub_adj = x_sub_adj * valid_mask
         
         sub_features_idx_list.append(x_sub_idx)

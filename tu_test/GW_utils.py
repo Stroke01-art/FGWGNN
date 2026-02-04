@@ -39,7 +39,6 @@ def fast_squared_euclidean(X, Y):
         return XX + YY - 2 * XY
     elif X.dim() == 3:
         # 3D mode: (B, N, D) x (B, M, D) -> (B, N, M)
-        # 使用 batch matrix multiplication，GPU 高度优化
         XX = (X * X).sum(-1, keepdim=True)  # (B, N, 1)
         YY = (Y * Y).sum(-1, keepdim=True)  # (B, M, 1)
         XY = torch.bmm(X, Y.transpose(-2, -1))  # (B, N, M)
@@ -85,8 +84,6 @@ def entropic_fused_gromov_wasserstein(
     q = h_filter.unsqueeze(0).expand(D_out, -1, -1)
 
     # 2. --- NORMALIZATION STEP 1: Structure Matrices ---
-    # 将结构矩阵归一化到 [0, 1] (防止不同图尺度带来的结构项波动)
-    # 如果是邻接矩阵(0/1)这步没影响，但如果是最短路径矩阵，这步至关重要
     C1_max = C1.amax(dim=(-2, -1), keepdim=True)
     C1 = C1 / (C1_max + 1e-8)
     
@@ -97,13 +94,10 @@ def entropic_fused_gromov_wasserstein(
     F1_reshaped = F1.reshape(D_out * batch_size, N_sub, D_feat)
     F2_expanded = F2.unsqueeze(1).expand(-1, batch_size, -1, -1).reshape(D_out * batch_size, N_filter, D_feat)
     
-    # 计算特征距离矩阵 M_f
     M_f = fast_squared_euclidean(F1_reshaped, F2_expanded)
     M_f = M_f.reshape(D_out, batch_size, N_sub, N_filter)
 
     # 4. --- NORMALIZATION STEP 2: Feature Cost Matrix ---
-    # 关键！将特征搬运代价归一化到 [0, 1]
-    # 这消除了特征数值大小(Scale)对 alpha 的影响，也解决了 "Hub +100" 导致代价过大的问题
     M_f_max = M_f.amax(dim=(-2, -1), keepdim=True)
     M_f = M_f / (M_f_max + 1e-8)
 
@@ -128,12 +122,10 @@ def entropic_fused_gromov_wasserstein(
     
     cost = None
     for _ in range(gw_iter):
-        # 计算结构代价 (基于归一化后的 C1, C2)
         temp = torch.einsum('dbij,dbjk->dbik', C1, T)
-        M_s = 2 * torch.einsum('dbik,dkl->dbil', temp, C2) # 这里 M_s 近似也在 [0, 2] 范围内
+        M_s = 2 * torch.einsum('dbik,dkl->dbil', temp, C2) 
         
-        # 如果 gw_iter > 1，建议也对 M_s 做归一化，但通常 C1/C2 归一化后 M_s 也是受控的
-        # 组合特征代价和结构代价，alpha_tensor 自动广播到 M_f 的形状
+
         cost = (1 - alpha_tensor) * M_f + alpha_tensor * M_s
         
         T = batch_sinkhorn(cost, p, q, epsilon, sinkhorn_iter)
